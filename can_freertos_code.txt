@@ -1,0 +1,202 @@
+/* USER CODE BEGIN PV */
+#include <string.h>
+#include <stdio.h>
+
+// CAN 消息结构体（用于队列传输）
+typedef struct {
+    uint32_t StdId;         // 标准 ID
+    uint8_t DLC;            // 数据长度
+    uint8_t Data[8];        // 数据内容
+} CanRxMsg_t;
+
+// 队列句柄
+QueueHandle_t xCanRxQueue;
+
+// 统计变量
+static uint32_t tx_frame_count = 0;     // 已发送帧数
+static uint32_t rx_frame_count = 0;     // 已接收帧数
+static uint32_t last_rx_id = 0;         // 最近一次接收的报文 ID
+
+// 帧计数（用于发送数据）
+static uint16_t frame_counter = 0;
+
+// 发送周期（ms）
+#define TX_PERIOD_MS    500
+/* USER CODE END PV */
+
+/* USER CODE BEGIN 0 */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+    CanRxMsg_t rx_msg;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    
+    // 从 FIFO0 读取接收到的报文
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &CAN_RxHeader, rx_data) == HAL_OK)
+    {
+        // 填充队列消息结构体
+        rx_msg.StdId = CAN_RxHeader.StdId;
+        rx_msg.DLC = CAN_RxHeader.DLC;
+        memcpy(rx_msg.Data, rx_data, 8);
+        
+        // 将消息发送到队列（从中断调用，使用 FromISR 版本）
+        xQueueSendFromISR(xCanRxQueue, &rx_msg, &xHigherPriorityTaskWoken);
+        
+        // 如果唤醒了一个更高优先级的任务，则请求上下文切换
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+/* USER CODE END 0 */
+
+/* USER CODE BEGIN RTOS_TASKS */
+void StartCanTxTask(void *argument)
+{
+    CAN_TxHeaderTypeDef TxHeader;
+    uint8_t TxData[8];
+    uint32_t TxMailbox;
+    
+    // 配置发送报文头
+    TxHeader.StdId = 0x101;         // 标准 ID
+    TxHeader.IDE = CAN_ID_STD;      // 标准帧
+    TxHeader.RTR = CAN_RTR_DATA;    // 数据帧
+    TxHeader.DLC = 8;               // 数据长度 = 8
+    
+    for (;;)
+    {
+        // 准备发送数据：帧计数（2字节）+ 固定测试数据（6字节）
+        TxData[0] = (uint8_t)(frame_counter & 0xFF);        // 低字节
+        TxData[1] = (uint8_t)((frame_counter >> 8) & 0xFF); // 高字节
+        TxData[2] = 0xAA;   // 固定测试数据
+        TxData[3] = 0x55;
+        TxData[4] = 0xAA;
+        TxData[5] = 0x55;
+        TxData[6] = 0xAA;
+        TxData[7] = 0x55;
+        
+        // 发送 CAN 报文
+        if (HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox) == HAL_OK)
+        {
+            // 发送成功，更新统计（进入临界区保护）
+            taskENTER_CRITICAL();
+            tx_frame_count++;
+            frame_counter++;        // 帧计数递增
+            taskEXIT_CRITICAL();
+        }
+        
+        // 延迟 500ms
+        vTaskDelay(pdMS_TO_TICKS(TX_PERIOD_MS));
+    }
+}
+/* USER CODE END RTOS_TASKS */
+
+void StartCanRxTask(void *argument)
+{
+    CanRxMsg_t rx_msg;
+    char print_buf[128];
+    
+    for (;;)
+    {
+        // 阻塞等待队列中的 CAN 消息
+        if (xQueueReceive(xCanRxQueue, &rx_msg, portMAX_DELAY) == pdTRUE)
+        {
+            // 更新统计和最近 ID（进入临界区保护）
+            taskENTER_CRITICAL();
+            rx_frame_count++;
+            last_rx_id = rx_msg.StdId;
+            taskEXIT_CRITICAL();
+            
+            // 格式化打印接收到的报文信息
+            sprintf(print_buf, "CAN Received: ID=0x%03X, DLC=%d, Data=", 
+                    rx_msg.StdId, rx_msg.DLC);
+            // 追加数据字节
+            for (int i = 0; i < rx_msg.DLC; i++) {
+                char tmp[4];
+                sprintf(tmp, "%02X ", rx_msg.Data[i]);
+                strcat(print_buf, tmp);
+            }
+            strcat(print_buf, "\r\n");
+            
+            // 通过串口输出
+            HAL_UART_Transmit(&huart1, (uint8_t*)print_buf, strlen(print_buf), 100);
+        }
+    }
+}
+
+void StartUartMonitorTask(void *argument)
+{
+    char status_buf[128];
+    uint32_t tx_cnt, rx_cnt, last_id;
+    TickType_t tick;
+    
+    for (;;)
+    {
+        // 读取统计变量（进入临界区保护）
+        taskENTER_CRITICAL();
+        tx_cnt = tx_frame_count;
+        rx_cnt = rx_frame_count;
+        last_id = last_rx_id;
+        taskEXIT_CRITICAL();
+        
+        // 获取系统 Tick
+        tick = xTaskGetTickCount();
+        
+        // 格式化状态信息
+        sprintf(status_buf, 
+                "=== CAN Status ===\r\n"
+                "Sent Frames: %lu\r\n"
+                "Received Frames: %lu\r\n"
+                "Last Received ID: 0x%03lX\r\n"
+                "System Tick: %lu\r\n"
+                "==================\r\n",
+                tx_cnt, rx_cnt, last_id, tick);
+        
+        // 通过串口输出
+        HAL_UART_Transmit(&huart1, (uint8_t*)status_buf, strlen(status_buf), 100);
+        
+        // 延迟 1 秒
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_CAN_Init();
+    MX_USART1_UART_Init();
+    
+    // 创建 CAN 接收队列（最多存放 10 个消息）
+    xCanRxQueue = xQueueCreate(10, sizeof(CanRxMsg_t));
+    
+    // 启动 CAN 外设
+    HAL_CAN_Start(&hcan);
+    // 激活 CAN 接收中断（FIFO0 消息挂起中断）
+    HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING);
+    
+    // 创建 FreeRTOS 任务
+    osThreadDef(CanTx, StartCanTxTask, osPriorityNormal, 0, 128);
+    osThreadCreate(osThread(CanTx), NULL);
+    
+    osThreadDef(CanRx, StartCanRxTask, osPriorityAboveNormal, 0, 256);
+    osThreadCreate(osThread(CanRx), NULL);
+    
+    osThreadDef(UartMonitor, StartUartMonitorTask, osPriorityBelowNormal, 0, 256);
+    osThreadCreate(osThread(UartMonitor), NULL);
+    
+    // 启动调度器
+    osKernelStart();
+    
+    for (;;) {}
+}
+
+CAN_FilterTypeDef sFilterConfig;
+sFilterConfig.FilterBank = 0;
+sFilterConfig.FilterMode = CAN_FILTERMODE_IDMASK;   // 掩码模式
+sFilterConfig.FilterScale = CAN_FILTERSCALE_32BIT;
+sFilterConfig.FilterIdHigh = 0x101 << 5;            // 要匹配的 ID
+sFilterConfig.FilterIdLow = 0x0000;
+sFilterConfig.FilterMaskIdHigh = 0x7FF << 5;       // 掩码：只匹配 ID 部分
+sFilterConfig.FilterMaskIdLow = 0x0000;
+sFilterConfig.FilterFIFOAssignment = CAN_RX_FIFO0;
+sFilterConfig.FilterActivation = ENABLE;
+HAL_CAN_ConfigFilter(&hcan, &sFilterConfig);
